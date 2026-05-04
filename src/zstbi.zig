@@ -5,7 +5,6 @@ const assert = std.debug.assert;
 pub fn init(allocator: std.mem.Allocator) void {
     assert(mem_allocator == null);
     mem_allocator = allocator;
-    mem_allocations = std.AutoHashMap(usize, usize).init(allocator);
 
     // stb image
     zstbiMallocPtr = zstbiMalloc;
@@ -22,13 +21,10 @@ pub fn init(allocator: std.mem.Allocator) void {
 
 pub fn deinit() void {
     assert(mem_allocator != null);
-    assert(mem_allocations.?.count() == 0);
 
     setFlipVerticallyOnLoad(false);
     setFlipVerticallyOnWrite(false);
 
-    mem_allocations.?.deinit();
-    mem_allocations = null;
     mem_allocator = null;
 }
 
@@ -378,64 +374,54 @@ pub fn setFlipVerticallyOnWrite(should_flip: bool) void {
 }
 
 var mem_allocator: ?std.mem.Allocator = null;
-var mem_allocations: ?std.AutoHashMap(usize, usize) = null;
-var mem_mutex: std.Thread.Mutex = .{};
 const mem_alignment = 16;
+
+comptime {
+    assert(@sizeOf(usize) <= mem_alignment);
+}
+
+fn allocBase(user_ptr: *anyopaque) [*]align(mem_alignment) u8 {
+    return @ptrFromInt(@intFromPtr(user_ptr) - mem_alignment);
+}
+
+fn allocSlice(user_ptr: *anyopaque) []align(mem_alignment) u8 {
+    const base = allocBase(user_ptr);
+    const total = @as(*usize, @ptrCast(base)).*;
+    return base[0..total];
+}
 
 extern var zstbiMallocPtr: ?*const fn (size: usize) callconv(.c) ?*anyopaque;
 extern var zstbiwMallocPtr: ?*const fn (size: usize) callconv(.c) ?*anyopaque;
 
 fn zstbiMalloc(size: usize) callconv(.c) ?*anyopaque {
-    mem_mutex.lock();
-    defer mem_mutex.unlock();
-
+    const total = size + mem_alignment;
     const mem = mem_allocator.?.alignedAlloc(
         u8,
         .fromByteUnits(mem_alignment),
-        size,
+        total,
     ) catch @panic("zstbi: out of memory");
-
-    mem_allocations.?.put(@intFromPtr(mem.ptr), size) catch @panic("zstbi: out of memory");
-
-    return mem.ptr;
+    @as(*usize, @ptrCast(mem.ptr)).* = total;
+    return mem.ptr + mem_alignment;
 }
 
 extern var zstbiReallocPtr: ?*const fn (ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque;
 extern var zstbiwReallocPtr: ?*const fn (ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque;
 
-fn zstbiRealloc(ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
-    mem_mutex.lock();
-    defer mem_mutex.unlock();
-
-    const old_size = if (ptr != null) mem_allocations.?.get(@intFromPtr(ptr.?)).? else 0;
-    const old_mem = if (old_size > 0)
-        @as([*]align(mem_alignment) u8, @ptrCast(@alignCast(ptr)))[0..old_size]
-    else
-        @as([*]align(mem_alignment) u8, undefined)[0..0];
-
-    const new_mem = mem_allocator.?.realloc(old_mem, size) catch @panic("zstbi: out of memory");
-
-    if (ptr != null) {
-        const removed = mem_allocations.?.remove(@intFromPtr(ptr.?));
-        std.debug.assert(removed);
-    }
-
-    mem_allocations.?.put(@intFromPtr(new_mem.ptr), size) catch @panic("zstbi: out of memory");
-
-    return new_mem.ptr;
+fn zstbiRealloc(maybe_ptr: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+    const user_ptr = maybe_ptr orelse return zstbiMalloc(size);
+    const new_total = size + mem_alignment;
+    const new_mem = mem_allocator.?.realloc(allocSlice(user_ptr), new_total) catch
+        @panic("zstbi: out of memory");
+    @as(*usize, @ptrCast(new_mem.ptr)).* = new_total;
+    return new_mem.ptr + mem_alignment;
 }
 
 extern var zstbiFreePtr: ?*const fn (maybe_ptr: ?*anyopaque) callconv(.c) void;
 extern var zstbiwFreePtr: ?*const fn (maybe_ptr: ?*anyopaque) callconv(.c) void;
 
 fn zstbiFree(maybe_ptr: ?*anyopaque) callconv(.c) void {
-    if (maybe_ptr) |ptr| {
-        mem_mutex.lock();
-        defer mem_mutex.unlock();
-
-        const size = mem_allocations.?.fetchRemove(@intFromPtr(ptr)).?.value;
-        const mem = @as([*]align(mem_alignment) u8, @ptrCast(@alignCast(ptr)))[0..size];
-        mem_allocator.?.free(mem);
+    if (maybe_ptr) |user_ptr| {
+        mem_allocator.?.free(allocSlice(user_ptr));
     }
 }
 
@@ -590,30 +576,35 @@ test "zstbi write and load file" {
     init(testing.allocator);
     defer deinit();
 
-    const pth = try std.fs.selfExeDirPathAlloc(testing.allocator);
-    defer testing.allocator.free(pth);
-    try std.posix.chdir(pth);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(testing.io, &path_buf);
+    const tmp_path = path_buf[0..tmp_len];
+
+    const png_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/test_img.png", .{tmp_path}, 0);
+    defer testing.allocator.free(png_path);
+    const jpg_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/test_img.jpg", .{tmp_path}, 0);
+    defer testing.allocator.free(jpg_path);
 
     var img = try Image.createEmpty(8, 6, 4, .{});
     defer img.deinit();
 
-    try img.writeToFile("test_img.png", ImageWriteFormat.png);
-    try img.writeToFile("test_img.jpg", .{ .jpg = .{ .quality = 80 } });
+    try img.writeToFile(png_path, ImageWriteFormat.png);
+    try img.writeToFile(jpg_path, .{ .jpg = .{ .quality = 80 } });
 
-    var img_png = try Image.loadFromFile("test_img.png", 0);
+    var img_png = try Image.loadFromFile(png_path, 0);
     defer img_png.deinit();
 
     try testing.expect(img_png.width == img.width);
     try testing.expect(img_png.height == img.height);
     try testing.expect(img_png.num_components == img.num_components);
 
-    var img_jpg = try Image.loadFromFile("test_img.jpg", 0);
+    var img_jpg = try Image.loadFromFile(jpg_path, 0);
     defer img_jpg.deinit();
 
     try testing.expect(img_jpg.width == img.width);
     try testing.expect(img_jpg.height == img.height);
     try testing.expect(img_jpg.num_components == 3); // RGB JPEG
-
-    try std.fs.cwd().deleteFile("test_img.png");
-    try std.fs.cwd().deleteFile("test_img.jpg");
 }
